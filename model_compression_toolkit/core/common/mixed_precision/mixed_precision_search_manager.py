@@ -112,7 +112,8 @@ class MixedPrecisionSearchManager:
         # Get from the framework an evaluation function on how a MP configuration,
         # affects the expected loss.
 
-        return self.sensitivity_evaluator.compute_metric
+        # return self.sensitivity_evaluator.compute_metric
+        return self.sensitivity_evaluator.compute_loss
 
     def compute_resource_utilization_matrix(self, target: RUTarget) -> np.ndarray:
         """

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from collections import defaultdict
 
 import numpy as np
 from pulp import *
@@ -287,17 +288,108 @@ def _build_layer_to_metrics_mapping(search_manager: MixedPrecisionSearchManager,
     """
 
     Logger.info('Starting to evaluate metrics')
-    layer_to_metrics_mapping = {}
+    layer_to_metrics_mapping = defaultdict(lambda: defaultdict(float))  # TODO - Work with defaultdict?
+
+    # ITAI - Test task loss as metric
+    from common.model_config import coco_keypoints_data_func
+    from network_dataset.dataset.dataset import Dataset
+    from network_dataset.dataset.preprocess import AspectPreservingResizeWithPad, Normalize, HWCtoCHW
+    from ultralytics.utils.loss import v8PoseLoss
+    from ultralytics import YOLO
+    import torch
+
+    def make_anchors(strides, device, grid_cell_offset=0.5):
+        """Generate anchors from features."""
+        anchor_points, stride_tensor = [], []
+        dtype, device = torch.float16, device
+        feats = [[80, 80], [40, 40], [20, 20]]
+        for i, stride in enumerate(strides):
+            h, w = feats[i]
+            sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset  # shift x
+            sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset  # shift y
+            sy, sx = torch.meshgrid(sy, sx)
+            anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2))
+            stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+        return torch.cat(anchor_points), torch.cat(stride_tensor)
+
+    class v11PoseLoss(v8PoseLoss):
+        def __call__(self, preds, batch):
+            """Calculate the total loss and detach it for pose estimation."""
+            loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+            pred_scores = preds[-2]
+            pred_bboxes = preds[-3]
+
+            dtype = pred_scores.dtype
+            device = 'cuda'
+            anchor_points, stride_tensor = make_anchors(self.stride, device, 0.5)
+
+            # Targets
+            batch_size = pred_scores.shape[0]
+            batch_idx = batch["batch_idx"].view(-1, 1)
+            targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            targets = self.preprocess(targets.to(device), batch_size, scale_tensor=torch.tensor([1, 1, 1, 1]).to('cuda'))
+            gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+            pred_kpts = preds[-1].permute(0, 2, 1).view(batch_size, -1, *self.kpt_shape)  # (b, h*w, 17, 3))
+            pred_kpts[..., :2] /= stride_tensor.view(1, -1, 1, 1)
+
+
+            _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+                pred_scores.detach(),
+                pred_bboxes.detach(),
+                anchor_points * stride_tensor,
+                gt_labels.to('cuda'),
+                gt_bboxes.to('cuda'),
+                mask_gt.to('cuda'),
+            )
+
+            target_scores_sum = max(target_scores.sum(), 1)
+
+            # Cls loss
+            loss[3] = self.bce(torch.log(pred_scores/(1-pred_scores)), target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+            # Bbox loss
+            if fg_mask.sum():
+                target_bboxes /= stride_tensor
+                pred_bboxes /= stride_tensor
+                self.bbox_loss.dfl_loss = None
+                pred_distri = torch.tensor([0]).to('cuda')
+                loss[0], loss[4] = self.bbox_loss(
+                    pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+                )
+                keypoints = batch["keypoints"].view(-1, 17, 3).to('cuda').float().clone()
+
+                loss[1], loss[2] = self.calculate_keypoints_loss(
+                    fg_mask, target_gt_idx, keypoints, batch_idx, stride_tensor, target_bboxes, pred_kpts
+                )
+
+            loss[0] *= 7.5  # box gain
+            loss[1] *= 12.0  # pose gain
+            loss[2] *= 1.0  # kobj gain
+            loss[3] *= 0.5  # cls gain
+            loss[4] *= 1.5  # dfl gain
+
+            return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+    temp_m = YOLO('/data/projects/swat/network_database/ModelZoo/Float-Pytorch-Models/yolov11/yolo11n-pose.pt')
+    temp_m.to('cuda')
+    loss_fn = v11PoseLoss(temp_m.model)
+
+    ds_for_metric = Dataset(dataset_info=coco_keypoints_data_func('/data/projects/swat'), background=False)
+    ds_for_metric.set_preprocessing(AspectPreservingResizeWithPad(640, 640,pad_value=114, resize_label=True), Normalize(0.0, 255.0), HWCtoCHW())
+    # ITAI - Test task loss as metric
+
+
 
     if target_resource_utilization.bops_restricted():
         origin_max_config = search_manager.config_reconstruction_helper.reconstruct_config_from_virtual_graph(search_manager.max_ru_config)
         max_config_value = search_manager.compute_metric_fn(origin_max_config)
     else:
-        max_config_value = search_manager.compute_metric_fn(search_manager.max_ru_config)
+        max_config_value = search_manager.compute_metric_fn(ds_for_metric, loss_fn, search_manager.max_ru_config)
 
     for node_idx, layer_possible_bitwidths_indices in tqdm(search_manager.layer_to_bitwidth_mapping.items(),
                                                            total=len(search_manager.layer_to_bitwidth_mapping)):
-        layer_to_metrics_mapping[node_idx] = {}
+        # layer_to_metrics_mapping[node_idx] = {}
 
         for bitwidth_idx in layer_possible_bitwidths_indices:
             if search_manager.max_ru_config[node_idx] == bitwidth_idx:
@@ -324,7 +416,7 @@ def _build_layer_to_metrics_mapping(search_manager: MixedPrecisionSearchManager,
                     origin_changed_nodes_indices,
                     origin_max_config)
             else:
-                metric_value = search_manager.compute_metric_fn(
+                metric_value = search_manager.compute_metric_fn(ds_for_metric, loss_fn,
                     mp_model_configuration,
                     [node_idx],
                     search_manager.max_ru_config)
