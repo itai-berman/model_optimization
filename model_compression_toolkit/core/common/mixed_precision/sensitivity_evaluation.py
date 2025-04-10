@@ -15,6 +15,7 @@
 import copy
 
 import numpy as np
+import torch
 from typing import Callable, Any, List, Tuple
 
 from model_compression_toolkit.constants import AXIS
@@ -185,6 +186,44 @@ class SensitivityEvaluation:
 
         return self._compute_mp_distance_measure(ipts_distances, out_pts_distances,
                                                  self.quant_config.distance_weighting_method)
+
+    def compute_loss(self,
+                     ds,
+                     loss,
+                     mp_model_configuration: List[int],
+                     node_idx: List[int] = None,
+                     baseline_mp_configuration: List[int] = None) -> float:
+        from model_compression_toolkit.core.pytorch.utils import to_torch_tensor, torch_tensor_to_numpy
+        # Configure MP model with the given configuration.
+        self._configure_bitwidths_model(mp_model_configuration,
+                                        node_idx)
+        total_loss = np.zeros((5, ))
+        for ind, (_, images, data) in enumerate(ds.data_generator(batch_size=20, start=2493)):
+            if ind >= 3:
+                break
+            batch = {'bboxes': [], 'keypoints': [], 'batch_idx': [], 'cls': []}
+            for i in range(data.shape[0]):
+                en = data[i]
+                for j in range(len(en['boxes'])):
+                    en['boxes'][j][0] += en['boxes'][j][2] / 2
+                    en['boxes'][j][1] += en['boxes'][j][3] / 2
+                    batch['bboxes'].append(en['boxes'][j])
+                    batch['keypoints'].append(np.reshape(en['keypoints'][j], (-1, 17, 3)))
+                    batch['batch_idx'].append(i)
+                    batch['cls'].append(en['classes'][j] - 1)
+            for k, v in batch.items():
+                batch[k] = torch.from_numpy(np.array(v)).to('cuda')
+            with torch.no_grad():
+                outputs = self.model_mp(to_torch_tensor(images))
+            total_loss = (total_loss * ind + loss(outputs, batch)[1].cpu().numpy()) / (ind + 1)
+
+        # Configure MP model back to the same configuration as the baseline model if baseline provided
+        if baseline_mp_configuration is not None:
+            self._configure_bitwidths_model(baseline_mp_configuration,
+                                            node_idx)
+
+        print(f'Loss: {total_loss}')
+        return np.sum(total_loss)
 
     def _init_baseline_tensors_list(self):
         """
@@ -472,9 +511,10 @@ def get_output_nodes_for_metric(graph: Graph) -> List[BaseNode]:
     """
 
     return [n.node for n in graph.get_outputs()
-            if (graph.fw_info.is_kernel_op(n.node.type) and
-                n.node.is_weights_quantization_enabled(graph.fw_info.get_kernel_op_attributes(n.node.type)[0])) or
-            n.node.is_activation_quantization_enabled()]
+            ]
+            # if (graph.fw_info.is_kernel_op(n.node.type) and
+            #     n.node.is_weights_quantization_enabled(graph.fw_info.get_kernel_op_attributes(n.node.type)[0])) or
+            # n.node.is_activation_quantization_enabled()]
 
 
 def bound_num_interest_points(sorted_ip_list: List[BaseNode], num_ip_factor: float) -> List[BaseNode]:
